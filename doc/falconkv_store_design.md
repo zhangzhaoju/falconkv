@@ -97,18 +97,32 @@ class FalconKVStore {
 public:
     struct Config {
         std::string ssd_path;          // SSD 数据根目录
-        uint32_t store_id;             // Store 唯一标识（从配置文件读取）
-        uint64_t capacity_bytes;        // 总容量
+        uint32_t store_id = 0;         // Store 唯一标识（从配置文件读取）
+        uint32_t node_id = 0;          // 节点 ID
+        uint64_t capacity_bytes = 500ULL * 1024 * 1024 * 1024; // 总容量
         uint32_t page_size = 4096;      // 页大小
         uint32_t io_threads = 4;        // IO 工作线程数
         uint32_t write_queue_size = 1024; // 写队列大小
         bool disable_mtime = true;      // 禁用文件修改时间更新
         std::string scheduler_uds_path; // IO Scheduler UDS 路径（可选）
         bool scheduler_enabled = true;  // 是否启用 Scheduler 上报
+        int scheduler_rpc_timeout_us = 2000; // Scheduler RPC 超时（微秒）
+        int max_consecutive_failures = 3;    // Scheduler 连续失败阈值
+        int reconnect_interval_sec = 2;     // Scheduler 重连间隔
+        std::string store_rpc_host = "127.0.0.1"; // Store RPC 主机地址
+        uint32_t listen_port = 8901;         // Store RPC 监听端口
         std::string meta_addr;          // Meta 服务器地址
+        uint32_t evict_grace_period_ms = 5000;    // 驱逐宽限期
+        uint32_t evict_check_interval_sec = 60;   // 驱逐检查间隔
+        double evict_high_watermark = 0.85;       // 驱逐高水位
+        double evict_low_watermark = 0.70;        // 驱逐低水位
+        uint64_t evict_cold_threshold_ms = 300000; // 冷数据阈值
         bool io_uring_enabled = true;   // 是否启用 io_uring
+        bool direct_io_enabled = true;  // 是否启用 DirectIO
         uint32_t io_uring_queue_depth = 128; // io_uring 队列深度
         uint32_t slot_size_bytes = 0;  // SlotAllocator 槽位大小（0 = 默认 2MB）
+
+        static Config FromStoreConfig(const StoreConfig& sc);
     };
 
     FalconKVStore(const Config& config);
@@ -517,14 +531,23 @@ private:
 ```cpp
 class StoreRpcClient {
 public:
-    Status Connect(const std::string& addr);
-    Status Write(uint64_t offset, const void* data, uint32_t size);
-    Status Read(uint64_t offset, void* buffer, uint32_t size);
+    Status Connect(const std::string& addr,
+                   uint64_t max_body_size_bytes = 512ULL * 1024 * 1024);
+    bool IsConnected() const;
+    Status Read(uint64_t offset, void* buffer, uint32_t size,
+                uint32_t client_id = 0,
+                const std::string& source_node_addr = "");
+    Status BatchRead(const std::vector<uint64_t>& offsets,
+                     const std::vector<uint32_t>& sizes,
+                     const std::vector<void*>& buffers,
+                     std::vector<int32_t>& results);
     Status Ping();
 
 private:
     brpc::Channel channel_;
     std::unique_ptr<FalconKVStoreService_Stub> stub_;
+    bool connected_ = false;
+    uint64_t max_body_size_bytes_ = 512ULL * 1024 * 1024;
 };
 ```
 
@@ -535,9 +558,12 @@ class StoreRpcClientManager {
 public:
     StoreRpcClient* GetOrCreate(const std::string& addr);
     void CloseAll();
+    void SetMaxBodySize(uint64_t max_body_size_bytes);
 
 private:
+    std::mutex mutex_;
     std::unordered_map<std::string, std::unique_ptr<StoreRpcClient>> clients_;
+    uint64_t max_body_size_bytes_ = 512ULL * 1024 * 1024;
 };
 ```
 
@@ -556,6 +582,21 @@ private:
     std::unordered_map<uint32_t, std::string> store_files_;  // store_id → data_file
     FdCache fd_cache_;  // 内部使用
 };
+```
+
+**StoreRpcClient::BatchRead 拆分逻辑**：
+
+StoreRpcClient::BatchRead 内部实现了按数据大小的自适应拆分，防止单次 RPC 超过 BRPC max body size 限制：
+
+```
+BatchRead(offsets, sizes, buffers, results):
+  1. 有效限制 = max_body_size_bytes_ * 90%（留 10% 给 protobuf 开销）
+  2. 贪心打包：按累加数据大小将 segments 切分为多个子批次
+     - 遍历所有 segment，累加 sizes[i]
+     - 当累加大小超过有效限制时，切分为一个子批次
+  3. 每个子批次独立发送 RPC，结果通过 original_indices 映射回原 results[]
+  4. 单个超大 segment（超过有效限制）仍单独发送，不跳过
+  5. 汇总所有子批次的结果到 results[] 后返回
 ```
 
 ## 3. Key-aware API 内部流程
@@ -1508,7 +1549,7 @@ ioctl(fd, FS_IOC_FSSETXATTR, &fsx);
 
 ## 11. 配置项
 
-Store 配置分为两部分：**common 区共享配置**（自动传播到所有模块）和 **store 区专属配置**。
+Store 配置分为三部分：**common 区共享配置**（自动传播到所有模块）、**store 区专属配置**和 **transfer 区 RPC 配置**。
 
 ### 11.1 common 区（共享，自动传播）
 
@@ -1545,3 +1586,9 @@ Store 配置分为两部分：**common 区共享配置**（自动传播到所有
 | `direct_io_enabled` | true | 是否启用 O_DIRECT 直接 IO（禁用后使用 buffered IO，适用于 tmpfs 等不支持 O_DIRECT 的文件系统） |
 | `io_uring_queue_depth` | 128 | io_uring 队列深度 |
 | `slot_size_bytes` | 0 | SlotAllocator 槽位大小（0 = 默认 2MB） |
+
+### 11.3 transfer 区
+
+| JSON 字段 (`transfer.*`) | 默认值 | 说明 |
+|------------------------|--------|------|
+| `max_body_size_mb` | 512 | BRPC max body size（MB），影响 BatchRead 子批次拆分 |

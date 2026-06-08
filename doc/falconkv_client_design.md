@@ -71,7 +71,7 @@ FalconKV 的 Python 集成采用 **四层分离** 架构，`FalconKVClientImpl` 
 │  │ Raw Python C API Module                                       │    │
 │  │                                                                │    │
 │  │ 模块级函数:                                                   │    │
-│  │  Init(config_json)               → handle                     │    │
+│  │  Init(config_file)               → handle                     │    │
 │  │  BatchExistSync(handle, keys)    → int                        │    │
 │  │  BatchPutSync(handle, keys,      → None                       │    │
 │  │    data_ptrs, sizes)                                          │    │
@@ -100,7 +100,7 @@ FalconKV 的 Python 集成采用 **四层分离** 架构，`FalconKVClientImpl` 
 │  │  - 管理 AsyncState 生命周期                                   │    │
 │  │  - Fire-and-Forget: 管理 PyObject 引用 + 回调                │    │
 │  │                                                                │    │
-│  │  + Init(config_json)                → bridge_handle           │    │
+│  │  + Init(config_file)                → bridge_handle           │    │
 │  │  + BatchExistSync(keys)             → int                     │    │
 │  │  + BatchPutSync(keys, ptrs, sizes)  → status                  │    │
 │  │  + BatchGetSync(keys, ptrs, sizes)  → bytes_read[]            │    │
@@ -182,9 +182,7 @@ struct KeyDescriptor {
     uint32_t store_id;         // Store 节点 ID
     uint64_t offset;           // 数据在 SSD 文件中的偏移（页面对齐）
     uint32_t size;             // 数据大小（字节）
-    uint32_t chunk_size;       // chunk 大小（来自 metadata）
     uint64_t access_time_ms;   // 最后访问时间
-    std::string data_file;     // Store 数据文件路径（Client 不直接使用，由 NodeLocalAccessor 内部使用）
     std::string store_addr;    // Store RPC 地址 (host:port，ACCESS_REMOTE_RPC 时使用)
 
     // 亲和性层级，决定 Client 的 IO 方式
@@ -338,7 +336,7 @@ Store 驱逐时先通过 `SyncRemove` 删除 Meta 元数据，但 Client 的 Key
 │     a. 查询 KeyDescCache 获取 key 描述                           │
 │        - 若缓存未命中: 构造 BatchLookupRequest RPC 到 Meta       │
 │        - 若 Meta 断连: BatchLookup 返回空结果（跳过 RPC 超时）   │
-│        - 将结果缓存（含 data_file 和 access_type）              │
+│        - 将结果缓存（含 store_addr 和 access_type）              │
 │                                                                  │
 │     b. 向 Scheduler 申请 IO (可选)                               │
 │        - scheduler_proxy_->RequestIO(store_id, total_size)      │
@@ -347,8 +345,8 @@ Store 驱逐时先通过 `SyncRemove` 删除 Meta 元数据，但 Client 的 Key
 │     c. 按 access_type 分组读取 — 三级亲和路径:                  │
 │                                                                  │
 │        [Level 0: ACCESS_LOCAL_DIRECT]                           │
-│        → local_store_->Get(key, buffer, size)                   │
-│        → FalconKVStore in-process 直通，~300us                   │
+│        → local_store_->BatchRead(local_reads)                   │
+│        → FalconKVStore in-process 批量直通，~300us                │
 │                                                                  │
 │        [Level 1: ACCESS_NODE_DIRECT]                            │
 │        → node_accessor_.Read(store_id, offset, buffer, size)   │
@@ -357,8 +355,9 @@ Store 驱逐时先通过 `SyncRemove` 删除 Meta 元数据，但 Client 的 Key
 │        → ~500us                                                  │
 │                                                                  │
 │        [Level 2: ACCESS_REMOTE_RPC]                             │
-│        → StoreRpcClient::Read(offset, buffer, size)             │
+│        → StoreRpcClient::BatchRead(offsets, sizes, buffers, results)│
 │        → brpc RPC 到远端 Store 服务，数据写入 buffer             │
+│        → BatchRead 内部按 max_body_size 自动拆分为多个子批次     │
 │        → ~2ms                                                    │
 │                                                                  │
 │     d. 并行执行所有分组读取                                      │
@@ -405,15 +404,15 @@ private:
 - **以 store_id 为索引**：Client 调用 `node_accessor_.Read(store_id, offset, ...)` 而非 `pread(fd, ...)`
 - **内部 FdCache**：NodeLocalAccessor 内部维护 FdCache，处理文件打开和复用
 - **DirectIO 对齐**：对齐处理逻辑封装在 NodeLocalAccessor 内部，Client 无需关心
-- **Level 0 分离**：ACCESS_LOCAL_DIRECT 不经过 NodeLocalAccessor，直接调用 `local_store_->Get()`
+- **Level 0 分离**：ACCESS_LOCAL_DIRECT 不经过 NodeLocalAccessor，直接调用 `local_store_->BatchRead()`
 
 #### 3.3.2 三级亲和性能对比
 
 | 层级 | IO 路径 | 预估延迟 | 网络开销 |
 |------|---------|----------|----------|
-| Level 0 | local_store_ in-process 直通 (FalconKVStore::Get) | ~300us | 无 |
+| Level 0 | local_store_ in-process 批量直通 (FalconKVStore::BatchRead) | ~300us | 无 |
 | Level 1 | NodeLocalAccessor DirectIO (FdCache + pread) | ~500us | 无（文件系统直读） |
-| Level 2 | StoreRpcClient RPC (brpc) | ~2ms | 一次网络往返 |
+| Level 2 | StoreRpcClient BatchRead RPC (brpc, 按大小自动拆分子批次) | ~2ms | 一次网络往返 |
 
 ### 3.4 batched_get_non_blocking
 
@@ -477,8 +476,9 @@ struct BridgeBuffer {
 class FalconKVBridge {
 public:
     struct Config {
-        std::string config_json;          // FalconKV 配置 JSON 字符串
-        size_t cache_capacity = 100000;   // Key 描述缓存容量
+        std::string config_file;         // FalconKV 配置文件路径
+        size_t cache_capacity = 100000;  // Key 描述缓存容量
+        int worker_id = -1;  // -1 表示未设置；>= 0 时自动计算 store_id
     };
 
     explicit FalconKVBridge(const Config& config);
@@ -535,16 +535,49 @@ private:
 namespace falconkv {
 
 FalconKVBridge::FalconKVBridge(const Config& config) {
+    // 1. 加载 FalconKVConfig
     FalconKVClientImpl::Config impl_config;
-    impl_config.config_file = config.config_json;
+    impl_config.config_file = config.config_file;
     impl_config.cache_capacity = config.cache_capacity;
+
+    // 2. 初始化日志
+    // ...
+
+    // 3. 设置 brpc max_body_size 从配置
+    // brpc::FLAGS_max_body_size = ... (从配置中读取)
+
+    // 4. worker_id >= 0 时计算 store_id 和 listen_port 偏移
+    if (config.worker_id >= 0) {
+        impl_config.store_id = config.worker_id;  // 或 hash(node_id)*max_gpu + worker_id
+        impl_config.listen_port = base_port + config.worker_id;
+    }
+
+    // 5. 创建 FalconKVStore 并 Init
+    store_ = std::make_unique<FalconKVStore>(store_config);
+    store_->Init(meta_addr);
+
+    // 6. 启动 Store RPC server
+    store_service_ = std::make_unique<StoreServiceImpl>(store_.get());
+    store_rpc_server_ = std::make_unique<brpc::Server>();
+    store_rpc_server_->AddService(store_service_.get(),
+                                   brpc::SERVER_DOESNT_OWN_SERVICE);
+    brpc::ServerOptions options;
+    store_rpc_server_->Start(listen_port, &options);
+
+    // 7. 创建 FalconKVClientImpl
     impl_ = std::make_unique<FalconKVClientImpl>(impl_config);
+
+    // 8. 绑定 Store 到 Client
+    impl_->BindStore(store_.get());
+
+    // 9. 启动 Fire-and-Forget 工作线程
+    for (size_t i = 0; i < kWorkerThreads; ++i) {
+        workers_.emplace_back(&FalconKVBridge::WorkerLoop, this);
+    }
 }
 
 FalconKVBridge::~FalconKVBridge() {
-    if (impl_) {
-        impl_->Close();
-    }
+    Close();
 }
 
 int FalconKVBridge::BatchExistSync(const std::vector<std::string>& keys) {
@@ -685,7 +718,7 @@ static PyObject* PyWrapper_Init(PyObject* self, PyObject* args) {
         return nullptr;
 
     falconkv::FalconKVBridge::Config config;
-    config.config_json = config_json;
+    config.config_file = config_json;
     config.cache_capacity = static_cast<size_t>(cache_capacity);
 
     falconkv::FalconKVBridge* bridge = nullptr;
@@ -1108,7 +1141,7 @@ static PyObject* PyWrapper_Close(PyObject* self, PyObject* args) {
 static PyMethodDef PyFalconKVInternalMethods[] = {
     {"Init",             PyWrapper_Init,             METH_VARARGS,
      "Initialize FalconKV bridge.\n"
-     "Args: config_json (str), [cache_capacity (int)]\n"
+     "Args: config_file (str), [cache_capacity (int)]\n"
      "Returns: handle (int)"},
     {"BatchExistSync",   PyWrapper_BatchExistSync,   METH_VARARGS,
      "Batch check key existence.\n"
@@ -1628,7 +1661,7 @@ class FalconKVConnectorAdapter(ConnectorAdapter):
 
 ## 6. 配置项
 
-Client 配置分为三部分：**Python 层 extra_config**（LMCache 传入）、**common 区共享配置**（自动传播）、**client 区专属配置**。
+Client 配置分为四部分：**Python 层 extra_config**（LMCache 传入）、**common 区共享配置**（自动传播）、**client 区专属配置**、**transfer 区 RPC 配置**。
 
 ### 6.1 Python 层 LMCache extra_config
 
@@ -1660,6 +1693,18 @@ Client 配置分为三部分：**Python 层 extra_config**（LMCache 传入）�
 | `cache_capacity` | 100000 | Key 描述缓存容量 |
 | `async_batch_size` | 16 | 异步操作并发度 |
 | `fire_and_forget` | true | 是否启用 Fire-and-Forget Put |
+
+### 6.4 JSON transfer 区
+
+| JSON 字段 (`transfer.*`) | 默认值 | 说明 |
+|------------------------|--------|------|
+| `protocol` | brpc | 通信协议 |
+| `meta_pool_size` | 4 | Meta RPC 连接池大小 |
+| `store_pool_size` | 4 | Store RPC 连接池大小 |
+| `rpc_timeout_ms` | 5000 | RPC 超时（毫秒） |
+| `connect_timeout_ms` | 3000 | 连接超时（毫秒） |
+| `max_retry` | 3 | RPC 最大重试次数 |
+| `max_body_size_mb` | 512 | BRPC max body size（MB），BatchRead 超过此限制时自动拆分子批次 |
 
 ## 7. IO Scheduler 集成
 
@@ -1755,7 +1800,7 @@ BatchPut/BatchGet 调用链:
 │ C++ Worker Thread Pool                            │
 │  - FalconKVBridge 适配层                          │
 │  - local_store_->BatchPut() (本地写入)             │
-│  - local_store_->Get() (本地读取)                   │
+│  - local_store_->BatchRead() (本地读取)             │
 │  - NodeLocalAccessor (同节点读取)                  │
 │  - RPC 到远端 Store (brpc)                         │
 │  - RPC 到 Meta (brpc)                             │

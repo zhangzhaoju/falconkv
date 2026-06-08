@@ -32,6 +32,11 @@ double GetEnvOrDefaultDouble(const char* key, double default_val) {
     return val ? std::atof(val) : default_val;
 }
 
+uint64_t GetEnvOrDefaultUInt64(const char* key, uint64_t default_val) {
+    const char* val = std::getenv(key);
+    return val ? std::strtoull(val, nullptr, 10) : default_val;
+}
+
 void ApplyEnvOverrides(FalconKVConfig& config) {
     // Common config overrides (shared across modules)
     config.common.meta_addr = GetEnvOrDefault("FALCONKV_META_ADDR", config.common.meta_addr);
@@ -108,6 +113,7 @@ void ApplyEnvOverrides(FalconKVConfig& config) {
     config.transfer.rpc_timeout_ms = GetEnvOrDefaultInt("FALCONKV_RPC_TIMEOUT_MS", config.transfer.rpc_timeout_ms);
     config.transfer.connect_timeout_ms = GetEnvOrDefaultInt("FALCONKV_CONNECT_TIMEOUT_MS", config.transfer.connect_timeout_ms);
     config.transfer.max_retry = GetEnvOrDefaultInt("FALCONKV_MAX_RETRY", config.transfer.max_retry);
+    config.transfer.max_body_size_mb = GetEnvOrDefaultUInt64("FALCONKV_MAX_BODY_SIZE_MB", config.transfer.max_body_size_mb);
 }
 
 void ParseCommonConfig(const Json::Value& root, CommonConfig& cfg) {
@@ -183,7 +189,6 @@ void ParseSchedulerConfig(const Json::Value& root, SchedulerConfig& cfg) {
     if (sc.isMember("ssd_bw_limit_mbps"))         cfg.ssd_bw_limit_mbps = sc["ssd_bw_limit_mbps"].asDouble();
     if (sc.isMember("net_bw_limit_mbps"))         cfg.net_bw_limit_mbps = sc["net_bw_limit_mbps"].asDouble();
     if (sc.isMember("stats_report_interval_sec")) cfg.stats_report_interval_sec = sc["stats_report_interval_sec"].asInt();
-    if (sc.isMember("stats_window_ms"))           cfg.stats_window_ms = sc["stats_window_ms"].asInt();
 }
 
 void ParseClientConfig(const Json::Value& root, ClientConfig& cfg) {
@@ -203,6 +208,7 @@ void ParseTransferConfig(const Json::Value& root, TransferConfig& cfg) {
     if (t.isMember("rpc_timeout_ms"))     cfg.rpc_timeout_ms = t["rpc_timeout_ms"].asInt();
     if (t.isMember("connect_timeout_ms")) cfg.connect_timeout_ms = t["connect_timeout_ms"].asInt();
     if (t.isMember("max_retry"))          cfg.max_retry = t["max_retry"].asInt();
+    if (t.isMember("max_body_size_mb"))   cfg.max_body_size_mb = t["max_body_size_mb"].asUInt64();
 }
 
 bool ParseJsonConfig(const std::string& json_str, FalconKVConfig& config) {

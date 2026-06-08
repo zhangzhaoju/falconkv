@@ -107,7 +107,7 @@ void StoreServiceImpl::BatchRead(::google::protobuf::RpcController* controller,
             total_io_size,
             request_ts_ns,
             done_ts_ns,
-            "");  // source_node_addr not available in BatchReadRequest
+            request->source_node_addr());
     }
 
     response->set_status(s.ok() ? 0 : static_cast<int>(s.code()));

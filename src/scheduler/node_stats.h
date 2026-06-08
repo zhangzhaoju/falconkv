@@ -59,7 +59,8 @@ struct TimeWindowStats {
 class NodeStats {
 public:
     explicit NodeStats(double ssd_bw_limit_mbps = 7000.0,
-                       double net_bw_limit_mbps = 12500.0);
+                       double net_bw_limit_mbps = 12500.0,
+                       int window_size_ms = 1000);
 
     /// Record a completed IO.
     void RecordIO(const IOCompletionData& record);
@@ -73,15 +74,18 @@ public:
     /// SSD bandwidth utilisation as a fraction of the configured limit.
     double GetSSDBandwidthUtilization() const;
 
-    /// Print a human-readable report to stdout.
-    void PrintReport() const;
+    /// Print a human-readable report and reset per-window counters.
+    void PrintReport();
+
+    /// Reset per-window accumulators (node_addr_stats_ and latency_samples_).
+    void ResetPerWindowCounters();
 
     static constexpr int WINDOW_COUNT = 60;
-    static constexpr int WINDOW_SIZE_MS = 1000;  // 1 second per window
 
 private:
     void UpdateWindow(const IOCompletionData& record);
     ChannelStats& GetChannelStats(TimeWindowStats& ws, int channel);
+    uint64_t WindowSizeNs() const;
 
     std::array<TimeWindowStats, WINDOW_COUNT> windows_;
     int current_window_idx_ = 0;
@@ -90,6 +94,7 @@ private:
 
     double ssd_bw_limit_mbps_;
     double net_bw_limit_mbps_;
+    const int window_size_ms_;
 
     // Reservoir of latency samples for percentile computation.
     std::vector<uint64_t> latency_samples_;

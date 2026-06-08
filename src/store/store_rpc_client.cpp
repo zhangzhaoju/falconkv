@@ -10,11 +10,14 @@ StoreRpcClient::StoreRpcClient() = default;
 
 StoreRpcClient::~StoreRpcClient() = default;
 
-Status StoreRpcClient::Connect(const std::string& addr) {
+Status StoreRpcClient::Connect(const std::string& addr,
+                               uint64_t max_body_size_bytes) {
     if (addr.empty()) {
         LOG(ERROR) << "[StoreRpcClient] Connect: empty store address";
         return Status::InvalidArg("empty store address");
     }
+
+    max_body_size_bytes_ = max_body_size_bytes;
 
     brpc::ChannelOptions options;
     options.connect_timeout_ms = 3000;
@@ -83,7 +86,8 @@ Status StoreRpcClient::Read(uint64_t offset, void* buffer, uint32_t size,
 Status StoreRpcClient::BatchRead(const std::vector<uint64_t>& offsets,
                                  const std::vector<uint32_t>& sizes,
                                  const std::vector<void*>& buffers,
-                                 std::vector<int32_t>& results) {
+                                 std::vector<int32_t>& results,
+                                 const std::string& source_node_addr) {
     if (!connected_) {
         LOG(ERROR) << "[StoreRpcClient] BatchRead: not connected";
         return Status::RpcError("not connected");
@@ -103,56 +107,113 @@ Status StoreRpcClient::BatchRead(const std::vector<uint64_t>& offsets,
         return Status::OK();
     }
 
-    BatchReadRequest request;
+    // Effective limit: reserve 10% for protobuf overhead
+    const uint64_t effective_limit =
+        max_body_size_bytes_ * 9 / 10;
+
+    // Greedy packing: split segments into sub-batches by accumulated data size
+    struct SubBatch {
+        std::vector<size_t> original_indices;
+        uint64_t total_data_size = 0;
+    };
+
+    std::vector<SubBatch> sub_batches;
+    SubBatch current;
     for (size_t i = 0; i < n; ++i) {
-        auto* seg = request.add_segments();
-        seg->set_offset(offsets[i]);
-        seg->set_size(sizes[i]);
+        uint64_t seg_size = sizes[i];
+        // If adding this segment exceeds the limit and current batch is non-empty,
+        // finalize current batch and start a new one.
+        if (!current.original_indices.empty() &&
+            current.total_data_size + seg_size > effective_limit) {
+            sub_batches.push_back(std::move(current));
+            current = SubBatch();
+        }
+        // Single oversized segment still goes into its own batch (may fail)
+        current.original_indices.push_back(i);
+        current.total_data_size += seg_size;
+    }
+    if (!current.original_indices.empty()) {
+        sub_batches.push_back(std::move(current));
     }
 
-    BatchReadResponse response;
-    brpc::Controller cntl;
-
-    stub_->BatchRead(&cntl, &request, &response, nullptr);
-
-    if (cntl.Failed()) {
-        LOG(ERROR) << "[StoreRpcClient] BatchRead RPC failed (" << n
-                   << " segments): " << cntl.ErrorText();
-        results.assign(n, -1);
-        return Status::RpcError("Store BatchRead RPC failed: " +
-                                std::string(cntl.ErrorText()));
+    if (sub_batches.size() > 1) {
+        LOG(INFO) << "[StoreRpcClient] BatchRead: splitting " << n
+                  << " segments into " << sub_batches.size()
+                  << " sub-batches (effective_limit="
+                  << effective_limit << " bytes)";
     }
 
-    if (response.status() != 0) {
-        LOG(ERROR) << "[StoreRpcClient] BatchRead failed with status="
-                   << response.status();
-        results.assign(n, -1);
-        return Status::IoError("Store BatchRead failed with status: " +
-                               std::to_string(response.status()));
-    }
+    // Execute each sub-batch as an independent RPC
+    bool any_rpc_failed = false;
+    for (const auto& batch : sub_batches) {
+        const auto& indices = batch.original_indices;
+        size_t batch_n = indices.size();
 
-    int seg_count = response.bytes_read_size();
-    if (static_cast<size_t>(seg_count) != n) {
-        LOG(ERROR) << "[StoreRpcClient] BatchRead: expected " << n
-                   << " segments, got " << seg_count;
-        results.assign(n, -1);
-        return Status::IoError("BatchRead segment count mismatch");
-    }
+        BatchReadRequest request;
+        for (size_t j = 0; j < batch_n; ++j) {
+            auto* seg = request.add_segments();
+            seg->set_offset(offsets[indices[j]]);
+            seg->set_size(sizes[indices[j]]);
+        }
+        if (!source_node_addr.empty()) {
+            request.set_source_node_addr(source_node_addr);
+        }
 
-    // Read data from brpc attachment (zero-copy path from server).
-    // Server lays out segments sequentially: [seg0][seg1]...[segN].
-    // bytes_read[i] tells us each segment's size in the attachment.
-    size_t att_offset = 0;
-    for (int i = 0; i < seg_count; ++i) {
-        uint32_t bytes_read = response.bytes_read(i);
-        if (bytes_read == 0) {
-            results[i] = -1;
+        BatchReadResponse response;
+        brpc::Controller cntl;
+
+        stub_->BatchRead(&cntl, &request, &response, nullptr);
+
+        if (cntl.Failed()) {
+            LOG(ERROR) << "[StoreRpcClient] BatchRead RPC failed (sub-batch of "
+                       << batch_n << " segments): " << cntl.ErrorText();
+            for (size_t j = 0; j < batch_n; ++j) {
+                results[indices[j]] = -1;
+            }
+            any_rpc_failed = true;
             continue;
         }
-        uint32_t to_copy = std::min(bytes_read, sizes[i]);
-        cntl.response_attachment().copy_to(buffers[i], to_copy, att_offset);
-        att_offset += bytes_read;
-        results[i] = static_cast<int32_t>(to_copy);
+
+        if (response.status() != 0) {
+            LOG(ERROR) << "[StoreRpcClient] BatchRead failed with status="
+                       << response.status();
+            for (size_t j = 0; j < batch_n; ++j) {
+                results[indices[j]] = -1;
+            }
+            any_rpc_failed = true;
+            continue;
+        }
+
+        int seg_count = response.bytes_read_size();
+        if (static_cast<size_t>(seg_count) != batch_n) {
+            LOG(ERROR) << "[StoreRpcClient] BatchRead: sub-batch expected "
+                       << batch_n << " segments, got " << seg_count;
+            for (size_t j = 0; j < batch_n; ++j) {
+                results[indices[j]] = -1;
+            }
+            any_rpc_failed = true;
+            continue;
+        }
+
+        // Read data from brpc attachment
+        size_t att_offset = 0;
+        for (int j = 0; j < seg_count; ++j) {
+            size_t orig_idx = indices[j];
+            uint32_t bytes_read = response.bytes_read(j);
+            if (bytes_read == 0) {
+                results[orig_idx] = -1;
+                continue;
+            }
+            uint32_t to_copy = std::min(bytes_read, sizes[orig_idx]);
+            cntl.response_attachment().copy_to(buffers[orig_idx], to_copy,
+                                               att_offset);
+            att_offset += bytes_read;
+            results[orig_idx] = static_cast<int32_t>(to_copy);
+        }
+    }
+
+    if (any_rpc_failed) {
+        return Status::RpcError("Store BatchRead: one or more sub-batches failed");
     }
 
     return Status::OK();

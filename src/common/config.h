@@ -55,7 +55,6 @@ struct SchedulerConfig {
     double ssd_bw_limit_mbps = 7000.0;
     double net_bw_limit_mbps = 12500.0;
     int stats_report_interval_sec = 5;
-    int stats_window_ms = 1000;
     int rpc_timeout_us = 2000;
     int max_consecutive_failures = 3;
     int reconnect_interval_sec = 2;
@@ -81,6 +80,7 @@ struct TransferConfig {
     int rpc_timeout_ms = 5000;
     int connect_timeout_ms = 3000;
     int max_retry = 3;
+    uint64_t max_body_size_mb = 512;  // BRPC max body size (MB)
 };
 
 struct FalconKVConfig {

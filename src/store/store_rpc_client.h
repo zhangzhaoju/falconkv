@@ -24,7 +24,9 @@ public:
     StoreRpcClient& operator=(const StoreRpcClient&) = delete;
 
     /// Connect to a remote Store server at the given address (host:port).
-    Status Connect(const std::string& addr);
+    /// @param max_body_size_bytes  BRPC max body size in bytes for splitting large batches.
+    Status Connect(const std::string& addr,
+                   uint64_t max_body_size_bytes = 512ULL * 1024 * 1024);
 
     /// Whether the client is connected.
     bool IsConnected() const { return connected_; }
@@ -41,11 +43,13 @@ public:
     /// @param sizes    Segment sizes.
     /// @param buffers  Pre-allocated output buffers (one per segment).
     /// @param results  Output: bytes read per segment (-1 on failure).
+    /// @param source_node_addr  Caller's store address (forwarded to remote store).
     /// @return OK if the RPC itself succeeded; individual failures are in results.
     Status BatchRead(const std::vector<uint64_t>& offsets,
                      const std::vector<uint32_t>& sizes,
                      const std::vector<void*>& buffers,
-                     std::vector<int32_t>& results);
+                     std::vector<int32_t>& results,
+                     const std::string& source_node_addr = "");
 
     /// Ping the remote store.
     Status Ping();
@@ -54,6 +58,7 @@ private:
     brpc::Channel channel_;
     std::unique_ptr<FalconKVStoreService_Stub> stub_;
     bool connected_ = false;
+    uint64_t max_body_size_bytes_ = 512ULL * 1024 * 1024;
 };
 
 } // namespace falconkv

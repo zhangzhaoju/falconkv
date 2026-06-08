@@ -238,7 +238,7 @@ Client               local_store_    NodeLocalAccessor    Store (远程)
   │                       │                │                  │
   │── 2. 按 access_type 分组读取:          │                  │
   │                       │                │                  │
-  │   [Level 0] local_store_->Get(key, buffer, size)          │
+  │   [Level 0] local_store_->BatchRead(local_reads)          │
   │──────────────────────▶│                │                  │
   │                       │── 查 MetaIndex │                  │
   │                       │── DirectIO 读  │                  │
@@ -249,12 +249,12 @@ Client               local_store_    NodeLocalAccessor    Store (远程)
   │                       │                │── FdCache + pread │
   │◀─ data ───────────────────────────────│                  │
   │                       │                │                  │
-  │   [Level 2] StoreRpcClient::Read(offset, buffer, size)   │
+  │   [Level 2] StoreRpcClient::BatchRead(offsets, sizes, buffers)│
   │──────────────────────────────────────────────────────────▶│
   │                       │                │                  │── DirectIO 读
   │◀─ data (RPC response)────────────────────────────────────│
   │                       │                │                  │
-  │  3. 三级路径可并行执行│                │                  │
+  │  3. 三级路径按 access_type 分组批量执行│                  │
 ```
 
 ## 4. 关键设计决策
@@ -282,7 +282,7 @@ Client 与本地 Store 共进程启动，同物理节点上的 Store 文件互�
 
 | 层级 | 亲和关系 | IO 方式 | 预估延迟 |
 |------|----------|----------|----------|
-| **Level 0** | 同进程 Store | `local_store_->Get()` in-process 直通 | ~300us |
+| **Level 0** | 同进程 Store | `local_store_->BatchRead()` in-process 批量直通 | ~300us |
 | **Level 1** | 同节点跨进程 Store | NodeLocalAccessor DirectIO (`FdCache + pread`) | ~500us |
 | **Level 2** | 远程节点 Store | StoreRpcClient RPC 到 Store 节点 | ~2ms |
 

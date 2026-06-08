@@ -44,7 +44,7 @@ sudo apt install -y build-essential cmake ninja-build git
 
 ```bash
 sudo apt install -y \
-    libprotobuf-dev protobuf-compiler \
+    libprotobuf-dev protobuf-compiler libprotoc-dev \
     libgoogle-glog-dev \
     libgflags-dev \
     libjsoncpp-dev \
@@ -81,6 +81,7 @@ mkdir build && cd build
 cmake -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=OFF \
+    -DWITH_GLOG=ON \
     ..
 ninja -j$(nproc)
 sudo ninja install
@@ -151,7 +152,7 @@ sudo dnf install -y gcc-c++ cmake ninja-build git
 
 ```bash
 sudo dnf install -y \
-    protobuf-devel protobuf-compiler \
+    protobuf-devel protobuf-compiler protobuf-lite-devel \
     glog-devel \
     gflags-devel \
     jsoncpp-devel \

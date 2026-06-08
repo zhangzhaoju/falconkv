@@ -38,8 +38,7 @@
         "schedule_policy": "passthrough",
         "ssd_bw_limit_mbps": 7000,
         "net_bw_limit_mbps": 12500,
-        "stats_report_interval_sec": 5,
-        "stats_window_ms": 1000
+        "stats_report_interval_sec": 5
     },
     "client": {
         "cache_capacity": 100000,
@@ -52,6 +51,7 @@
         "store_pool_size": 4,
         "rpc_timeout_ms": 5000,
         "connect_timeout_ms": 3000,
-        "max_retry": 3
+        "max_retry": 3,
+        "max_body_size_mb": 512
     }
 }

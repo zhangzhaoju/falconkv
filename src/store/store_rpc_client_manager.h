@@ -26,9 +26,13 @@ public:
     /// Close all cached clients.
     void CloseAll();
 
+    /// Set the BRPC max body size (in bytes) for all future connections.
+    void SetMaxBodySize(uint64_t max_body_size_bytes);
+
 private:
     std::mutex mutex_;
     std::unordered_map<std::string, std::unique_ptr<StoreRpcClient>> clients_;
+    uint64_t max_body_size_bytes_ = 512ULL * 1024 * 1024;
 };
 
 } // namespace falconkv

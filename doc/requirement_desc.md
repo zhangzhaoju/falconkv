@@ -230,13 +230,17 @@ scheduler模块也是一个独立启动的进程, 进程名叫falconkv_scheduler
 虽然模型部署后每次使用的size都是固定的,但不易在部署时获得具体是多大, falconkv需要根据alloc设置size大小而不是启动时设定, 且若申请多次申请的size大小发生变化需要抛出异常,表示当前不支持多种size;
 请设计方案支持这种情况.
 
+
+第三十二轮交互:
+当前在FalconKVBridge::FalconKVBridge中配置类brpc最大的传输size为512M, 由于对BRPC的数据传输做了批处理, 若一个批次的总size操作512M会失败, 因此需要基于设置的brpc最大传输size设置brpc数据传输batch的size. 请基于该情况分析优化方案.
+
+第三十三轮交互:
+当前同一节点的VLLM会拉起多个 Worker, 每个worker动态加载FalconKVConnector, 为了简化配置所有FalconKVConnector共用同一个配置falconkv.json, 但是falconkv.json中配置的store连接信息 store_rpc_host和listen_port是固定的, 为了确保每个FalconKVConnector有独立的监听端口, 需要将falconkv.json配置的listen_port 添加一个基于store_id的偏移值, 即实际的监听端口listen_port = 配置的listen_port+ worker_id; worker_id 通过PyWrapper_Init接口传入, 并用于计算store_id; 请给出完整的方案
+
 其他待处理:
 1. FireAndForgetPut的逻辑存在错误, 需要将FireAndForgetPut的优先级低于读数据的优先级别, 但是当前并没有这种处理
    可以先对接待后续完善
 2. 当前并能不支持从磁盘恢复Meta信息, 后续使用pwritev+preadv 读写meta + data的模式存放数据, 同时通过bitmap来标记有效block位置, 定期持久化bitmap来用于数据恢复.
 3. 当前rpc通信存在延时问题,需要将速率统计的的RPC消息修改为提交异步任务上报速率统计
 4. 考虑如何支持集成HCCL进行通信
-
-
-
-
+5. FalconKVClientImpl::DoRead 和 local_store_addr_ 貌似不再使用了需要清理

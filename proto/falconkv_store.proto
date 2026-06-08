@@ -32,6 +32,7 @@ message BatchReadSegment {
 
 message BatchReadRequest {
     repeated BatchReadSegment segments = 1;
+    optional string source_node_addr = 2;
 }
 
 message BatchReadResponse {

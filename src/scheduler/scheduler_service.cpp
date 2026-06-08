@@ -23,7 +23,8 @@ FalconKVScheduler::FalconKVScheduler(const SchedulerConfig& config)
     }
 
     stats_ = std::make_unique<NodeStats>(config_.ssd_bw_limit_mbps,
-                                         config_.net_bw_limit_mbps);
+                                         config_.net_bw_limit_mbps,
+                                         config_.stats_report_interval_sec * 1000);
     ssd_bw_acc_ = std::make_unique<SSDBandwidthAccumulator>(config_.ssd_bw_limit_mbps);
     net_bw_acc_ = std::make_unique<NetBandwidthAccumulator>(config_.net_bw_limit_mbps);
 }

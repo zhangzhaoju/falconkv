@@ -8,6 +8,7 @@ The Client internally delegates to FalconKVBridge -> FalconKVClientImpl.
 import asyncio
 import os
 from typing import List, Optional
+from lmcache.logging import init_logger
 
 try:
     from pyfalconkv.client import Client as FalconKVClient
@@ -18,6 +19,8 @@ try:
     from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 except ImportError:
     RemoteConnector = object
+
+logger = init_logger(__name__)
 
 
 class FalconKVConnector(RemoteConnector):
@@ -55,9 +58,10 @@ class FalconKVConnector(RemoteConnector):
         self._fire_and_forget = fire_and_forget
 
         # 通过 Client -> FalconKVBridge -> FalconKVClientImpl 初始化
-        worker_id = int(os.getenv("LMCACHE_PLUGIN_WORKER_ID", "-1"))
+        worker_id = local_cpu_backend.metadata.worker_id
         self._client = FalconKVClient(config_file, cache_capacity,
                                       worker_id=worker_id)
+        logger.info(f"RUN_TIME_WORKER_ID value is {worker_id}")
 
         # 异步并发控制
         self._async_semaphore = asyncio.Semaphore(async_batch_size)

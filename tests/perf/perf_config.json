@@ -57,7 +57,7 @@
       "node_id": 2,
       "store_id": 3,
       "listen_port": 18923,
-      "ssd_path": "/home/zhangzhaoju/Learn/code/falconkv/perf_log/falconkv_perf_ssd/C",
+      "ssd_path": "/home/zhangzhaoju/Learn/code/perf_log/falconkv_perf_ssd/C",
       "capacity_gb": 50,
       "cache_capacity": 100000,
       "io_threads": 8,

@@ -22,7 +22,7 @@ StoreRpcClient* StoreRpcClientManager::GetOrCreate(const std::string& addr) {
 
     // Create a new client
     auto client = std::make_unique<StoreRpcClient>();
-    Status s = client->Connect(addr);
+    Status s = client->Connect(addr, max_body_size_bytes_);
     if (!s.ok()) {
         return nullptr;
     }
@@ -31,6 +31,10 @@ StoreRpcClient* StoreRpcClientManager::GetOrCreate(const std::string& addr) {
     LOG(INFO) << "[StoreRpcClientManager] Created new StoreRpcClient for " << addr;
     clients_[addr] = std::move(client);
     return raw;
+}
+
+void StoreRpcClientManager::SetMaxBodySize(uint64_t max_body_size_bytes) {
+    max_body_size_bytes_ = max_body_size_bytes;
 }
 
 void StoreRpcClientManager::CloseAll() {

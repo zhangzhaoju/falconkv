@@ -22,16 +22,24 @@ FalconKVBridge::FalconKVBridge(const Config& config) {
 
     // Increase brpc max body size for large batch RPCs (default 64MB is too
     // small for BatchRead with many 1MB segments).
-    gflags::SetCommandLineOption("max_body_size", "536870912");
+    uint64_t max_body = cfg.transfer.max_body_size_mb * 1024ULL * 1024ULL;
+    gflags::SetCommandLineOption("max_body_size",
+                                  std::to_string(max_body).c_str());
 
-    // 当 worker_id >= 0 时，自动计算 store_id = node_id * 10 + worker_id
+    // 当 worker_id >= 0 时，自动计算 store_id 和 listen_port
+    // store_id = node_id * 10 + worker_id  (全局唯一)
+    // listen_port = base_port + worker_id   (同节点端口唯一)
     if (config.worker_id >= 0) {
         uint32_t old_store_id = cfg.store.store_id;
+        uint32_t old_port = cfg.store.listen_port;
         cfg.store.store_id = cfg.store.node_id * 10 + config.worker_id;
+        cfg.store.listen_port = cfg.store.listen_port + config.worker_id;
         LOG(INFO) << "[FalconKVBridge] LMCache worker_id=" << config.worker_id
                   << ", node_id=" << cfg.store.node_id
                   << ", computed store_id=" << cfg.store.store_id
-                  << " (overrides store_id=" << old_store_id << ")";
+                  << ", listen_port=" << cfg.store.listen_port
+                  << " (overrides store_id=" << old_store_id
+                  << ", port=" << old_port << ")";
     }
 
     // 创建并初始化 FalconKVStore

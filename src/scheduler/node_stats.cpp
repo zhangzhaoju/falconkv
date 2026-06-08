@@ -17,19 +17,17 @@ uint64_t NowNanos() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(tp).count());
 }
 
-uint64_t WindowSizeNs() {
-    return static_cast<uint64_t>(NodeStats::WINDOW_SIZE_MS) * 1000000ULL;
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // NodeStats
 // ---------------------------------------------------------------------------
 
-NodeStats::NodeStats(double ssd_bw_limit_mbps, double net_bw_limit_mbps)
+NodeStats::NodeStats(double ssd_bw_limit_mbps, double net_bw_limit_mbps,
+                     int window_size_ms)
     : ssd_bw_limit_mbps_(ssd_bw_limit_mbps),
-      net_bw_limit_mbps_(net_bw_limit_mbps) {
+      net_bw_limit_mbps_(net_bw_limit_mbps),
+      window_size_ms_(window_size_ms) {
     uint64_t base = NowNanos();
     uint64_t ws = WindowSizeNs();
     for (int i = 0; i < WINDOW_COUNT; ++i) {
@@ -38,6 +36,10 @@ NodeStats::NodeStats(double ssd_bw_limit_mbps, double net_bw_limit_mbps)
     }
     current_window_idx_ = WINDOW_COUNT - 1;
     latency_samples_.reserve(MAX_LATENCY_SAMPLES);
+}
+
+uint64_t NodeStats::WindowSizeNs() const {
+    return static_cast<uint64_t>(window_size_ms_) * 1000000ULL;
 }
 
 ChannelStats& NodeStats::GetChannelStats(TimeWindowStats& ws, int channel) {
@@ -162,7 +164,7 @@ double NodeStats::GetSSDBandwidthUtilization() const {
     return bw / ssd_bw_limit_mbps_;
 }
 
-void NodeStats::PrintReport() const {
+void NodeStats::PrintReport() {
     std::lock_guard<std::mutex> lock(mutex_);
 
     const auto& w = windows_[current_window_idx_];
@@ -228,6 +230,15 @@ void NodeStats::PrintReport() const {
     }
 
     LOG(INFO) << "=== End Report ===";
+
+    // Reset per-window counters so the next report shows only the new window's data.
+    ResetPerWindowCounters();
+}
+
+void NodeStats::ResetPerWindowCounters() {
+    // mutex_ is already held by PrintReport().
+    node_addr_stats_.clear();
+    latency_samples_.clear();
 }
 
 }  // namespace falconkv

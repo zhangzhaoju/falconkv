@@ -67,9 +67,6 @@ public:
     void SetLocalStore(FalconKVStore* store) { local_store_ = store; }
 
 private:
-    /// Unified read path dispatching based on AccessType.
-    Status DoRead(const KeyDescriptor& desc, void* buffer, uint32_t size);
-
     /// Get or create a StoreRpcClient for the given store_id.
     StoreRpcClient* GetStoreRpcClient(uint32_t store_id);
 
@@ -98,8 +95,9 @@ private:
     // This client's node identity for access type determination.
     uint32_t node_id_ = 0;
 
-    // Local store address (host:port) for remote-read source identification.
-    std::string local_store_addr_;
+    // This client's own store address (store_rpc_host:listen_port),
+    // sent to remote stores so they can report rx_read stats to the scheduler.
+    std::string self_store_addr_;
 };
 
 } // namespace falconkv

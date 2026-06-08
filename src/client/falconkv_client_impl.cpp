@@ -22,9 +22,9 @@ FalconKVClientImpl::FalconKVClientImpl(const Config& config)
         node_id_ = cfg.store.node_id;
     }
 
-    // Compute local store address for remote-read source identification
-    local_store_addr_ = cfg.store.store_rpc_host + ":"
-                        + std::to_string(cfg.store.listen_port);
+    // Build self store address for remote reads (store_rpc_host:listen_port)
+    self_store_addr_ = cfg.store.store_rpc_host + ":"
+                     + std::to_string(cfg.store.listen_port);
 
     // Connect to remote Meta server via RPC
     Status meta_status = meta_client_.Connect(cfg.transfer.meta_addr);
@@ -68,48 +68,13 @@ FalconKVClientImpl::FalconKVClientImpl(const Config& config)
     nla_cfg.io_uring_enabled = cfg.store.io_uring_enabled;
     nla_cfg.io_uring_queue_depth = cfg.store.io_uring_queue_depth;
     node_accessor_.InitIOEngines(nla_cfg);
+
+    // Pass max_body_size config to StoreRpcClientManager for batch splitting
+    store_rpc_mgr_.SetMaxBodySize(cfg.transfer.max_body_size_mb * 1024ULL * 1024ULL);
 }
 
 FalconKVClientImpl::~FalconKVClientImpl() {
     Close();
-}
-
-// -----------------------------------------------------------------
-// Unified read dispatch
-// -----------------------------------------------------------------
-Status FalconKVClientImpl::DoRead(const KeyDescriptor& desc,
-                                   void* buffer, uint32_t size) {
-    switch (desc.access_type) {
-        case AccessType::ACCESS_LOCAL_DIRECT:
-            if (local_store_) {
-                auto result = local_store_->Get(desc.key, buffer, size);
-                return result.status;
-            }
-            LOG(ERROR) << "[FalconKVClient] DoRead: local store not set for ACCESS_LOCAL_DIRECT, key="
-                       << desc.key;
-            return Status::IoError("local store not set for ACCESS_LOCAL_DIRECT");
-
-        case AccessType::ACCESS_NODE_DIRECT:
-            return node_accessor_.Read(desc.store_id, desc.offset,
-                                        buffer, size);
-
-        case AccessType::ACCESS_REMOTE_RPC: {
-            StoreRpcClient* rpc = GetStoreRpcClient(desc.store_id);
-            if (!rpc) {
-                LOG(ERROR) << "[FalconKVClient] DoRead: no RPC client for store "
-                           << desc.store_id << ", key=" << desc.key;
-                return Status::RpcError(
-                    "no RPC client for store " + std::to_string(desc.store_id));
-            }
-            return rpc->Read(desc.offset, buffer, size,
-                             node_id_, local_store_addr_);
-        }
-
-        default:
-            LOG(ERROR) << "[FalconKVClient] DoRead: unknown access type="
-                       << static_cast<int>(desc.access_type) << ", key=" << desc.key;
-            return Status::NotSupported("unknown access type");
-    }
 }
 
 // -----------------------------------------------------------------
@@ -488,7 +453,8 @@ std::vector<int32_t> FalconKVClientImpl::BatchGet(
 
             uint64_t start_ts = GetCurrentTimeNs();
             std::vector<int32_t> rpc_results;
-            Status batch_status = rpc->BatchRead(offsets, seg_sizes, seg_bufs, rpc_results);
+            Status batch_status = rpc->BatchRead(offsets, seg_sizes, seg_bufs, rpc_results,
+                                                  self_store_addr_);
             uint64_t done_ts = GetCurrentTimeNs();
 
             if (!batch_status.ok()) {
