@@ -36,7 +36,7 @@
     },
     {
       "client_id": "B",
-      "node_id": 1,
+      "node_id": 2,
       "store_id": 2,
       "listen_port": 18912,
       "ssd_path": "/home/zhangzhaoju/Learn/code/perf_log/falconkv_perf_ssd/B",

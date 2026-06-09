@@ -7,17 +7,15 @@
 #include "src/common/config.h"
 #include "src/scheduler/passthrough_policy.h"
 #include "src/scheduler/node_stats.h"
-#include "src/scheduler/ssd_bw_accumulator.h"
-#include "src/scheduler/net_bw_accumulator.h"
 
 namespace falconkv {
 
 // ---------------------------------------------------------------------------
 // FalconKVScheduler
 //
-// The central scheduling daemon.  It owns a scheduling policy, a statistics
-// engine, and SSD/network bandwidth accumulators.  Clients/stores can call
-// HandleRequestIO / HandleIOCompletion directly (in-process) or via RPC.
+// The central scheduling daemon.  It owns a scheduling policy and a statistics
+// engine.  Clients/stores can call HandleRequestIO / HandleIOCompletion
+// directly (in-process) or via RPC.
 // ---------------------------------------------------------------------------
 class FalconKVScheduler {
 public:
@@ -41,8 +39,6 @@ private:
     SchedulerConfig config_;
     std::unique_ptr<IOSchedulePolicy> policy_;
     std::unique_ptr<NodeStats> stats_;
-    std::unique_ptr<SSDBandwidthAccumulator> ssd_bw_acc_;
-    std::unique_ptr<NetBandwidthAccumulator> net_bw_acc_;
     std::thread stats_thread_;
     std::atomic<bool> running_{false};
 };

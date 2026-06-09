@@ -359,34 +359,10 @@
 | UT-SC-009 | 带宽计算 | 1 秒内记录 100MB IO | BandwidthMBps | 约 100 MB/s |
 | UT-SC-010 | 零窗口带宽 | - | window_ns=0 | 返回 0 |
 | UT-SC-011 | 大传输带宽 | - | BandwidthMBps | 正确计算 |
-| UT-SC-012 | 延迟百分位 | 插入 100 个样本 | p50/p99 | 近似正确 |
+| UT-SC-012 | 延迟百分位 | 插入 100 个样本到 channel 0 | local_ssd_read.p50/p99 | 近似正确 |
 | UT-SC-013 | 按节点地址统计 | 不同 node_addr | RecordIO | 分别统计 |
 | UT-SC-014 | SSD 带宽利用率 | - | 检查 | 计算 correct |
-
-#### 6.1.3 SSDBandwidthAccumulator (`tests/unit/scheduler/test_ssd_bw_accumulator.cpp`)
-
-| 编号 | 测试项 | 前置条件 | 测试步骤 | 预期结果 |
-|------|--------|----------|----------|----------|
-| UT-SC-015 | 跟踪 SSD 通道 | OnIOStart LOCAL_SSD_WRITE | GetConcurrentBandwidthMBps | 带宽 > 0 |
-| UT-SC-016 | 多个 SSD IO 累加 | 多个 LOCAL_SSD 请求 | GetConcurrentBandwidthMBps | 带宽累加 |
-| UT-SC-017 | 非 SSD 通道排除 | OnIOStart NET_TX_READ | GetConcurrentBandwidthMBps | 返回 0 |
-| UT-SC-018 | OnIODone 移除 | OnIOStart → OnIODone | GetConcurrentBandwidthMBps | 带宽归零 |
-| UT-SC-019 | 峰值带宽跟踪 | 多次 IO | peak_bandwidth | 正确记录峰值 |
-| UT-SC-020 | SSD 饱和检测 | - | IsSSDBandwidthSaturated | 默认 false |
-
-#### 6.1.4 NetBandwidthAccumulator (`tests/unit/scheduler/test_net_bw_accumulator.cpp`)
-
-| 编号 | 测试项 | 前置条件 | 测试步骤 | 预期结果 |
-|------|--------|----------|----------|----------|
-| UT-SC-021 | 按节点地址分通道 | 两个不同 node_addr | GetNetTxBandwidthToNodeMBps | 分别返回 |
-| UT-SC-022 | TX/RX 独立计算 | NET_TX + NET_RX | 分别查询 | TX ≈ 100MB/s, RX ≈ 50MB/s |
-| UT-SC-023 | 仅 RX 活跃 | 只有 NET_RX | TX 带宽为 0 | RX 有值 |
-| UT-SC-024 | 按节点 TX 带宽 | 不同节点 TX | PerNodeTXBandwidth | 分别正确 |
-| UT-SC-025 | 按节点 RX 带宽 | 不同节点 RX | PerNodeRXBandwidth | 分别正确 |
-| UT-SC-026 | 峰值带宽跟踪 | 多次 IO | peak | 正确 |
-| UT-SC-027 | 默认不饱和 | - | IsSaturated | false |
-| UT-SC-028 | OnIODone 移除 | OnIOStart → OnIODone | 带宽 | 归零 |
-| UT-SC-029 | Local SSD 通道不跟踪 | LOCAL_SSD | Get | 不计入 |
+| UT-SC-015 | 按通道延迟隔离 | 4 个通道分别注入不同延迟 | ChannelStats | 各通道延迟独立正确 |
 
 ### 6.2 模块测试 (`tests/module/test_scheduler_service.cpp`)
 
@@ -870,8 +846,6 @@ falconkv/
 │   │   └── scheduler/
 │   │       ├── test_passthrough_policy.cpp
 │   │       ├── test_node_stats.cpp
-│   │       ├── test_ssd_bw_accumulator.cpp
-│   │       ├── test_net_bw_accumulator.cpp
 │   │       └── test_bypass.cpp
 │   ├── module/                        # C++ 模块测试（GTest + 真实 brpc Server）
 │   │   ├── test_client_batch_ops.cpp

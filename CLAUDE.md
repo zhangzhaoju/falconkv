@@ -42,7 +42,7 @@ src/
 ├── meta/       Metadata aggregation service: MetaManager, sharded in-memory store with per-shard read-write locks, standalone `falconkv_master` process
 ├── store/      SSD storage: FalconKVStore with DirectIO, StoreMetaIndex, MetaSyncClient, EvictManager
 ├── transfer/   RPC layer: TransferManager, TransferChannel (abstract), BrpcChannel
-└── scheduler/  IO scheduling: FalconKVScheduler, IOSchedulePolicy, bandwidth accumulators
+└── scheduler/  IO scheduling: FalconKVScheduler, IOSchedulePolicy, NodeStats (per-channel latency)
 ```
 
 ### Batch Operation Flows
@@ -79,7 +79,7 @@ Each Store manages its own space and eviction:
 
 ### Scheduler
 
-`FalconKVScheduler` coordinates IO within a node. Clients request IO permission and report completion. `PassthroughPolicy` currently admits all requests immediately. The scheduler tracks SSD and network bandwidth via accumulators. If the scheduler becomes unavailable, clients bypass it (configurable via `scheduler_enabled`). Communication is via Unix domain socket (`/tmp/falconkv_scheduler.sock`).
+`FalconKVScheduler` coordinates IO within a node. Clients request IO permission and report completion. `PassthroughPolicy` currently admits all requests immediately. The scheduler collects per-channel bandwidth and latency statistics via `NodeStats`. If the scheduler becomes unavailable, clients bypass it (configurable via `scheduler_enabled`). Communication is via Unix domain socket (`/tmp/falconkv_scheduler.sock`).
 
 ### Transfer Layer
 

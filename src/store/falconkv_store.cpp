@@ -77,6 +77,7 @@ FalconKVStore::Config FalconKVStore::Config::FromStoreConfig(const StoreConfig& 
 FalconKVStore::FalconKVStore(const Config& config)
     : config_(config), store_id_(config.store_id) {
     data_file_ = config_.ssd_path + "/kv_data_" + std::to_string(store_id_);
+    store_rpc_addr_ = config_.store_rpc_host + ":" + std::to_string(config_.listen_port);
 }
 
 FalconKVStore::~FalconKVStore() {

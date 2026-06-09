@@ -35,7 +35,9 @@ NodeStats::NodeStats(double ssd_bw_limit_mbps, double net_bw_limit_mbps,
         windows_[i].window_end_ns   = base - static_cast<uint64_t>(WINDOW_COUNT - i - 1) * ws;
     }
     current_window_idx_ = WINDOW_COUNT - 1;
-    latency_samples_.reserve(MAX_LATENCY_SAMPLES);
+    for (auto& reservoir : latency_samples_) {
+        reservoir.reserve(MAX_LATENCY_SAMPLES);
+    }
 }
 
 uint64_t NodeStats::WindowSizeNs() const {
@@ -72,10 +74,6 @@ void NodeStats::UpdateWindow(const IOCompletionData& record) {
         windows_[next].net_tx_read     = {};
         windows_[next].net_rx_read     = {};
         windows_[next].concurrent_peak = 0;
-        windows_[next].avg_latency_us  = 0.0;
-        windows_[next].p50_latency_us  = 0.0;
-        windows_[next].p99_latency_us  = 0.0;
-        windows_[next].max_latency_us  = 0.0;
         idx = next;
     }
     current_window_idx_ = idx;
@@ -110,15 +108,17 @@ void NodeStats::RecordIO(const IOCompletionData& record) {
         }
     }
 
-    // 3. Collect latency sample.
-    if (record.io_done_ts_ns >= record.io_start_ts_ns) {
+    // 3. Collect latency sample into per-channel reservoir.
+    if (record.io_done_ts_ns >= record.io_start_ts_ns
+        && record.io_channel >= 0 && record.io_channel < 4) {
         uint64_t latency_ns = record.io_done_ts_ns - record.io_start_ts_ns;
-        if (latency_samples_.size() >= MAX_LATENCY_SAMPLES) {
+        auto& reservoir = latency_samples_[record.io_channel];
+        if (reservoir.size() >= MAX_LATENCY_SAMPLES) {
             // Simple reservoir: replace a random entry.
-            size_t pos = static_cast<size_t>(latency_ns % latency_samples_.size());
-            latency_samples_[pos] = latency_ns;
+            size_t pos = static_cast<size_t>(latency_ns % reservoir.size());
+            reservoir[pos] = latency_ns;
         } else {
-            latency_samples_.push_back(latency_ns);
+            reservoir.push_back(latency_ns);
         }
     }
 }
@@ -127,21 +127,23 @@ TimeWindowStats NodeStats::GetCurrentStats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     TimeWindowStats snap = windows_[current_window_idx_];
 
-    // Compute latency percentiles from the reservoir.
-    if (!latency_samples_.empty()) {
-        std::vector<uint64_t> sorted = latency_samples_;
+    // Compute per-channel latency percentiles.
+    auto compute_latency = [](ChannelStats& cs, const std::vector<uint64_t>& samples) {
+        if (samples.empty()) return;
+        std::vector<uint64_t> sorted = samples;
         std::sort(sorted.begin(), sorted.end());
-
         double sum = 0.0;
         for (uint64_t v : sorted) sum += static_cast<double>(v);
-        snap.avg_latency_us = (sum / static_cast<double>(sorted.size())) / 1000.0;
+        cs.avg_latency_us = (sum / static_cast<double>(sorted.size())) / 1000.0;
+        cs.p50_latency_us = static_cast<double>(sorted[sorted.size() / 2]) / 1000.0;
+        cs.p99_latency_us = static_cast<double>(sorted[static_cast<size_t>(sorted.size() * 0.99)]) / 1000.0;
+        cs.max_latency_us = static_cast<double>(sorted.back()) / 1000.0;
+    };
+    compute_latency(snap.local_ssd_read,  latency_samples_[0]);
+    compute_latency(snap.local_ssd_write, latency_samples_[1]);
+    compute_latency(snap.net_tx_read,     latency_samples_[2]);
+    compute_latency(snap.net_rx_read,     latency_samples_[3]);
 
-        snap.p50_latency_us = static_cast<double>(
-            sorted[sorted.size() / 2]) / 1000.0;
-        snap.p99_latency_us = static_cast<double>(
-            sorted[static_cast<size_t>(sorted.size() * 0.99)]) / 1000.0;
-        snap.max_latency_us = static_cast<double>(sorted.back()) / 1000.0;
-    }
     return snap;
 }
 
@@ -173,34 +175,43 @@ void NodeStats::PrintReport() {
     LOG(INFO) << "=== Node Stats Report (window " << w.window_start_ns
               << "-" << w.window_end_ns << " ns) ===";
 
+    // Compute per-channel latency percentiles from reservoirs.
+    auto compute_latency = [](ChannelStats& cs, const std::vector<uint64_t>& samples) {
+        if (samples.empty()) return;
+        std::vector<uint64_t> sorted = samples;
+        std::sort(sorted.begin(), sorted.end());
+        double sum = 0.0;
+        for (uint64_t v : sorted) sum += static_cast<double>(v);
+        cs.avg_latency_us = (sum / static_cast<double>(sorted.size())) / 1000.0;
+        cs.p50_latency_us = static_cast<double>(sorted[sorted.size() / 2]) / 1000.0;
+        cs.p99_latency_us = static_cast<double>(sorted[static_cast<size_t>(sorted.size() * 0.99)]) / 1000.0;
+        cs.max_latency_us = static_cast<double>(sorted.back()) / 1000.0;
+    };
+
+    // Make mutable copies for latency computation.
+    TimeWindowStats cw = w;
+    compute_latency(cw.local_ssd_read,  latency_samples_[0]);
+    compute_latency(cw.local_ssd_write, latency_samples_[1]);
+    compute_latency(cw.net_tx_read,     latency_samples_[2]);
+    compute_latency(cw.net_rx_read,     latency_samples_[3]);
+
     auto print_ch = [&window_ns](const char* label, const ChannelStats& cs) {
         LOG(INFO) << "  " << std::setw(20) << std::left << label
                   << "  bytes=" << cs.total_bytes
                   << "  ios=" << cs.io_count
                   << "  bw=" << std::fixed << std::setprecision(2)
-                  << cs.BandwidthMBps(window_ns) << " MB/s";
+                  << cs.BandwidthMBps(window_ns) << " MB/s"
+                  << "  avg=" << std::fixed << std::setprecision(1)
+                  << cs.avg_latency_us << " us"
+                  << "  p50=" << cs.p50_latency_us << " us"
+                  << "  p99=" << cs.p99_latency_us << " us"
+                  << "  max=" << cs.max_latency_us << " us";
     };
 
-    print_ch("local_ssd_read",  w.local_ssd_read);
-    print_ch("local_ssd_write", w.local_ssd_write);
-    print_ch("net_tx_read",     w.net_tx_read);
-    print_ch("net_rx_read",     w.net_rx_read);
-
-    if (!latency_samples_.empty()) {
-        std::vector<uint64_t> sorted = latency_samples_;
-        std::sort(sorted.begin(), sorted.end());
-        double sum = 0.0;
-        for (uint64_t v : sorted) sum += static_cast<double>(v);
-        LOG(INFO) << "  latency: avg=" << std::fixed << std::setprecision(1)
-                  << (sum / static_cast<double>(sorted.size()) / 1000.0)
-                  << " us  p50="
-                  << (static_cast<double>(sorted[sorted.size() / 2]) / 1000.0)
-                  << " us  p99="
-                  << (static_cast<double>(sorted[static_cast<size_t>(sorted.size() * 0.99)]) / 1000.0)
-                  << " us  max="
-                  << (static_cast<double>(sorted.back()) / 1000.0)
-                  << " us  samples=" << sorted.size();
-    }
+    print_ch("local_ssd_read",  cw.local_ssd_read);
+    print_ch("local_ssd_write", cw.local_ssd_write);
+    print_ch("net_tx_read",     cw.net_tx_read);
+    print_ch("net_rx_read",     cw.net_rx_read);
 
     // Compute SSD BW utilization inline (mutex_ is already held by
     // PrintReport, so we must NOT call GetSSDBandwidthUtilization() which
@@ -238,7 +249,9 @@ void NodeStats::PrintReport() {
 void NodeStats::ResetPerWindowCounters() {
     // mutex_ is already held by PrintReport().
     node_addr_stats_.clear();
-    latency_samples_.clear();
+    for (auto& reservoir : latency_samples_) {
+        reservoir.clear();
+    }
 }
 
 }  // namespace falconkv

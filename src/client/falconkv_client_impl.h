@@ -26,6 +26,7 @@ struct BufferInfo {
 class FalconKVClientImpl {
 public:
     struct Config {
+        std::string store_rpc_addr;
         std::string config_file;
         size_t cache_capacity = 100000;
         int async_batch_size = 16;

@@ -115,6 +115,7 @@ public:
     uint32_t store_id() const { return store_id_; }
     uint32_t node_id() const { return config_.node_id; }
     const std::string& data_file() const { return data_file_; }
+    const std::string& store_rpc_addr() const { return store_rpc_addr_; }
     SchedulerProxy* scheduler_proxy() const { return scheduler_proxy_.get(); }
 
 private:
@@ -125,6 +126,7 @@ private:
     int data_fd_buffered_ = -1;   // Buffered fd (always open, no O_DIRECT)
     uint32_t store_id_;
     std::string data_file_;
+    std::string store_rpc_addr_;
     std::atomic<bool> running_{false};
     std::unique_ptr<AlignedBufferPool> buffer_pool_;
     std::unique_ptr<IOThreadPool> io_pool_;

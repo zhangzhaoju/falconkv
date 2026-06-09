@@ -243,4 +243,6 @@ scheduler模块也是一个独立启动的进程, 进程名叫falconkv_scheduler
 2. 当前并能不支持从磁盘恢复Meta信息, 后续使用pwritev+preadv 读写meta + data的模式存放数据, 同时通过bitmap来标记有效block位置, 定期持久化bitmap来用于数据恢复.
 3. 当前rpc通信存在延时问题,需要将速率统计的的RPC消息修改为提交异步任务上报速率统计
 4. 考虑如何支持集成HCCL进行通信
-5. FalconKVClientImpl::DoRead 和 local_store_addr_ 貌似不再使用了需要清理
+5. 需要使用较小的内存预分配大小, 跨主机读取网络读取和磁盘读取可以做成pipline模式, 将请求发送后异步等待结果;
+   接收端接收到请求后将任务投递给落盘队列, 消息返回在罗盘后回掉处理
+

@@ -68,6 +68,7 @@ FalconKVBridge::FalconKVBridge(const Config& config) {
     FalconKVClientImpl::Config impl_config;
     impl_config.config_file = config.config_file;
     impl_config.cache_capacity = config.cache_capacity;
+    impl_config.store_rpc_addr = store_->store_rpc_addr();
     impl_ = std::make_unique<FalconKVClientImpl>(impl_config);
 
     // 将 Store 绑定到 Client

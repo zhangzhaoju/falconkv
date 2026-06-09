@@ -1,8 +1,6 @@
 set(SCHEDULER_TESTS
     test_passthrough_policy
     test_node_stats
-    test_ssd_bw_accumulator
-    test_net_bw_accumulator
     test_bypass
 )
 

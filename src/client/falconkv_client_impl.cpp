@@ -23,8 +23,14 @@ FalconKVClientImpl::FalconKVClientImpl(const Config& config)
     }
 
     // Build self store address for remote reads (store_rpc_host:listen_port)
-    self_store_addr_ = cfg.store.store_rpc_host + ":"
-                     + std::to_string(cfg.store.listen_port);
+    // Prefer externally provided address (from Store object) to avoid
+    // inconsistency when Bridge modifies the port after loading config.
+    if (!config_.store_rpc_addr.empty()) {
+        self_store_addr_ = config_.store_rpc_addr;
+    } else if (!config_.config_file.empty()) {
+        self_store_addr_ = cfg.store.store_rpc_host + ":"
+                         + std::to_string(cfg.store.listen_port);
+    }
 
     // Connect to remote Meta server via RPC
     Status meta_status = meta_client_.Connect(cfg.transfer.meta_addr);

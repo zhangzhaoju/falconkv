@@ -1,8 +1,6 @@
 add_library(falconkv_scheduler STATIC
     passthrough_policy.cpp
     node_stats.cpp
-    ssd_bw_accumulator.cpp
-    net_bw_accumulator.cpp
     scheduler_service.cpp
     scheduler_service_impl.cpp
     scheduler_server.cpp

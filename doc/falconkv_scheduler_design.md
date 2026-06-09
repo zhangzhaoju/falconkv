@@ -6,8 +6,7 @@ IO Scheduler 是 FalconKV 在每个计算节点内部部署的 IO 调度与监�
 
 - **IO 调度**：协调同一节点上多个 Client 和多个 Store 之间的 IO 时序，避免 IO 争抢导致带宽浪费
 - **带宽统计**：收集本节点所有 IO 的启动时间、完成时间、数据量，计算实时带宽和时延
-- **峰值检测**：对同一时间窗口内并发的多个 IO 请求带宽进行累加，判断是否打满硬件带宽
-- **统计输出**：定期打印节点级吞吐和时延统计信息
+- **统计输出**：定期打印节点级吞吐和时延统计信息（按 IO 通道分别输出）
 
 ### 1.1 问题背景
 
@@ -33,9 +32,8 @@ IO Scheduler 是 FalconKV 在每个计算节点内部部署的 IO 调度与监�
 
 | 目标 | 说明 |
 |------|------|
-| IO 可观测 | 收集节点内所有 IO 的带宽、时延、并发度数据 |
+| IO 可观测 | 收集节点内所有 IO 的带宽、时延、并发度数据，按通道分别统计 |
 | 调度介入 | 当前阶段为放通模式（Passthrough），后续可扩展为限流/排队策略 |
-| 峰值带宽检测 | 累加并发 IO 带宽，判断是否能打满硬件带宽上限 |
 | 故障快速感知 | Scheduler 异常退出或 hang 时，Client/Store 快速 bypass |
 | 低额外开销 | 调度 RPC 延迟 < 50us，不影响正常 IO 路径 |
 
@@ -69,11 +67,10 @@ IO Scheduler 是 FalconKV 在每个计算节点内部部署的 IO 调度与监�
 │  │  │ (Per-Client) │ │ (BW/Latency) │ │ (Watchdog)       │   │    │
 │  │  └──────────────┘ └──────────────┘ └──────────────────┘   │    │
 │  │                                                             │    │
-│  │  ┌──────────────┐ ┌──────────────┐                         │    │
-│  │  │ 调度策略     │ │ 峰值检测     │                         │    │
-│  │  │ (Passthrough)│ │ (Bandwidth   │                         │    │
-│  │  │              │ │  Accumulator)│                         │    │
-│  │  └──────────────┘ └──────────────┘                         │    │
+│  │  ┌──────────────┐                                          │    │
+│  │  │ 调度策略     │                                          │    │
+│  │  │ (Passthrough)│                                          │    │
+│  │  └──────────────┘                                          │    │
 │  └─────────────────────────┬──────────────────────────────────┘    │
 │                             │ ②③调度决策                          │
 │                             │ (当前: 立即放通)                     │
@@ -269,6 +266,12 @@ struct ChannelStats {
     uint64_t total_bytes = 0;   // 通道总数据量
     uint32_t io_count = 0;      // IO 次数
 
+    // 按通道的延迟百分位统计（从 reservoir 计算）
+    double avg_latency_us = 0.0;
+    double p50_latency_us = 0.0;
+    double p99_latency_us = 0.0;
+    double max_latency_us = 0.0;
+
     double BandwidthMBps(uint64_t window_ns) const {
         if (window_ns == 0) return 0.0;
         return (total_bytes / (1024.0 * 1024.0)) / (window_ns / 1e9);
@@ -294,7 +297,7 @@ struct TimeWindowStats {
     uint64_t window_start_ns;  // 窗口起始时间
     uint64_t window_end_ns;    // 窗口结束时间
 
-    // 按通道分列统计
+    // 按通道分列统计（每个通道包含独立的带宽和延迟数据）
     ChannelStats local_ssd_read;
     ChannelStats local_ssd_write;
     ChannelStats net_tx_read;
@@ -302,12 +305,6 @@ struct TimeWindowStats {
 
     // 汇总统计
     uint32_t concurrent_peak;  // 窗口内最大并发 IO 数
-
-    // 延迟统计（仅成功的 IO）
-    double   avg_latency_us;   // 平均延迟
-    double   p50_latency_us;   // P50 延迟
-    double   p99_latency_us;   // P99 延迟
-    double   max_latency_us;   // 最大延迟
 
     // 资源消耗汇总
     // SSD 带宽 = local_ssd_read + local_ssd_write + net_rx_read
@@ -365,15 +362,15 @@ private:
     double ssd_bw_limit_mbps_;     // SSD 带宽上限 MB/s
     double net_bw_limit_mbps_;     // 网络带宽上限 MB/s
 
-    // 延迟直方图（用于百分位计算）
-    std::vector<uint64_t> latency_samples_;  // 最近 N 个延迟样本
+    // 按通道的延迟采样 reservoir（索引 = IOChannel 枚举值: 0-3）
+    std::array<std::vector<uint64_t>, 4> latency_samples_;
     static constexpr size_t MAX_LATENCY_SAMPLES = 10000;
 };
 ```
 
-### 4.2 带宽累加与峰值检测
+### 4.2 按通道延迟统计
 
-LLM 推理场景下，多个 IO 是瞬时并发的。需要对同一时间窗口内并发的 IO 带宽需求进行累加，与硬件带宽上限比较。带宽累加器按资源消耗类型拆分为 SSD 带宽累加器和网络带宽累加器，网络部分按远程节点地址分通道累加：
+延迟统计按 IO 通道独立采样和计算，每个通道维护独立的 reservoir，互不影响：
 
 ```
 资源消耗模型:
@@ -396,282 +393,62 @@ SSD 带宽 = LOCAL_SSD_READ + LOCAL_SSD_WRITE + NET_RX_READ
 网络 RX  = NET_RX_READ (按 source_node_addr 分通道)
 ```
 
-```cpp
-// SSD 带宽累加器
-// 累加消耗 SSD 带宽的通道：LOCAL_SSD_READ/WRITE + NET_RX_READ
-// 写入始终绑定本地 Store，远程只有读请求
-class SSDBandwidthAccumulator {
-public:
-    void OnIOStart(uint64_t ticket, uint64_t start_ts_ns, uint64_t io_size,
-                   IOChannel channel) {
-        // 仅累加消耗 SSD 带宽的通道
-        if (!ConsumesSSD(channel)) return;
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        ActiveIO aio;
-        aio.ticket = ticket;
-        aio.start_ts_ns = start_ts_ns;
-        aio.io_size = io_size;
-        aio.channel = channel;
-        active_ios_.push_back(aio);
-        UpdatePeakBandwidth(start_ts_ns);
-    }
-
-    void OnIODone(uint64_t ticket, uint64_t done_ts_ns, uint64_t io_size) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = std::find_if(active_ios_.begin(), active_ios_.end(),
-            [ticket](const ActiveIO& a) { return a.ticket == ticket; });
-        if (it != active_ios_.end()) {
-            active_ios_.erase(it);
-        }
-    }
-
-    double GetConcurrentBandwidthMBps(uint64_t now_ns) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        double total_bandwidth = 0.0;
-        for (const auto& aio : active_ios_) {
-            double elapsed_s = (now_ns - aio.start_ts_ns) / 1e9;
-            if (elapsed_s > 0) {
-                total_bandwidth +=
-                    (aio.io_size / (1024.0 * 1024.0)) / elapsed_s;
-            }
-        }
-        return total_bandwidth;
-    }
-
-    bool IsSSDBandwidthSaturated() const {
-        return GetConcurrentBandwidthMBps(GetCurrentTimeNs())
-               >= ssd_bw_limit_mbps_ * saturation_threshold_;
-    }
-
-    double GetPeakBandwidthMBps() const { return peak_bandwidth_mbps_; }
-
-private:
-    static bool ConsumesSSD(IOChannel ch) {
-        // LOCAL_SSD_READ=0, LOCAL_SSD_WRITE=1, NET_RX_READ=3
-        return ch == LOCAL_SSD_READ || ch == LOCAL_SSD_WRITE
-            || ch == NET_RX_READ;
-    }
-
-    struct ActiveIO {
-        uint64_t ticket;
-        uint64_t start_ts_ns;
-        uint64_t io_size;
-        IOChannel channel;
-    };
-
-    void UpdatePeakBandwidth(uint64_t ts_ns) {
-        double current_bw = GetConcurrentBandwidthMBps(ts_ns);
-        if (current_bw > peak_bandwidth_mbps_) {
-            peak_bandwidth_mbps_ = current_bw;
-            peak_ts_ns_ = ts_ns;
-        }
-    }
-
-    mutable std::mutex mutex_;
-    std::vector<ActiveIO> active_ios_;
-    double ssd_bw_limit_mbps_;         // SSD 硬件带宽上限 MB/s
-    double saturation_threshold_ = 0.9;
-    double peak_bandwidth_mbps_ = 0.0;
-    uint64_t peak_ts_ns_ = 0;
-};
-
-// 网络带宽累加器
-// 按远程节点地址分通道累加网络 TX/RX 带宽
-// 仅统计读操作的网络流量（写入始终绑定本地 Store，无远程写路径）
-class NetBandwidthAccumulator {
-public:
-    void OnIOStart(uint64_t ticket, uint64_t start_ts_ns, uint64_t io_size,
-                   IOChannel channel, const std::string& node_addr) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ActiveIO aio;
-        aio.ticket = ticket;
-        aio.start_ts_ns = start_ts_ns;
-        aio.io_size = io_size;
-        aio.channel = channel;
-        aio.node_addr = node_addr;
-        active_ios_.push_back(aio);
-        UpdatePeakBandwidth(start_ts_ns);
-    }
-
-    void OnIODone(uint64_t ticket) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = std::find_if(active_ios_.begin(), active_ios_.end(),
-            [ticket](const ActiveIO& a) { return a.ticket == ticket; });
-        if (it != active_ios_.end()) {
-            active_ios_.erase(it);
-        }
-    }
-
-    // 获取总网络 TX 带宽（NET_TX_READ）
-    double GetNetTxBandwidthMBps(uint64_t now_ns) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        double total = 0.0;
-        for (const auto& aio : active_ios_) {
-            if (aio.channel == NET_TX_READ) {
-                double elapsed_s = (now_ns - aio.start_ts_ns) / 1e9;
-                if (elapsed_s > 0) {
-                    total += (aio.io_size / (1024.0 * 1024.0)) / elapsed_s;
-                }
-            }
-        }
-        return total;
-    }
-
-    // 获取总网络 RX 带宽（NET_RX_READ）
-    double GetNetRxBandwidthMBps(uint64_t now_ns) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        double total = 0.0;
-        for (const auto& aio : active_ios_) {
-            if (aio.channel == NET_RX_READ) {
-                double elapsed_s = (now_ns - aio.start_ts_ns) / 1e9;
-                if (elapsed_s > 0) {
-                    total += (aio.io_size / (1024.0 * 1024.0)) / elapsed_s;
-                }
-            }
-        }
-        return total;
-    }
-
-    // 获取到特定远程节点的 TX 带宽
-    double GetNetTxBandwidthToNodeMBps(uint64_t now_ns,
-                                        const std::string& node_addr) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        double total = 0.0;
-        for (const auto& aio : active_ios_) {
-            if (aio.node_addr == node_addr && aio.channel == NET_TX_READ) {
-                double elapsed_s = (now_ns - aio.start_ts_ns) / 1e9;
-                if (elapsed_s > 0) {
-                    total += (aio.io_size / (1024.0 * 1024.0)) / elapsed_s;
-                }
-            }
-        }
-        return total;
-    }
-
-    // 获取来自特定节点的 RX 带宽
-    double GetNetRxBandwidthFromNodeMBps(uint64_t now_ns,
-                                          const std::string& node_addr) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        double total = 0.0;
-        for (const auto& aio : active_ios_) {
-            if (aio.node_addr == node_addr && aio.channel == NET_RX_READ) {
-                double elapsed_s = (now_ns - aio.start_ts_ns) / 1e9;
-                if (elapsed_s > 0) {
-                    total += (aio.io_size / (1024.0 * 1024.0)) / elapsed_s;
-                }
-            }
-        }
-        return total;
-    }
-
-    bool IsNetTxBandwidthSaturated() const {
-        return GetNetTxBandwidthMBps(GetCurrentTimeNs())
-               >= net_bw_limit_mbps_ * saturation_threshold_;
-    }
-
-    bool IsNetRxBandwidthSaturated() const {
-        return GetNetRxBandwidthMBps(GetCurrentTimeNs())
-               >= net_bw_limit_mbps_ * saturation_threshold_;
-    }
-
-    // 获取所有参与网络 IO 的节点地址列表
-    std::vector<std::string> GetActiveNodeAddrs() const;
-
-    double GetPeakNetTxBandwidthMBps() const { return peak_net_tx_mbps_; }
-    double GetPeakNetRxBandwidthMBps() const { return peak_net_rx_mbps_; }
-
-private:
-    struct ActiveIO {
-        uint64_t ticket;
-        uint64_t start_ts_ns;
-        uint64_t io_size;
-        IOChannel channel;
-        std::string node_addr;
-    };
-
-    void UpdatePeakBandwidth(uint64_t ts_ns) {
-        double tx_bw = GetNetTxBandwidthMBps(ts_ns);
-        double rx_bw = GetNetRxBandwidthMBps(ts_ns);
-        if (tx_bw > peak_net_tx_mbps_) peak_net_tx_mbps_ = tx_bw;
-        if (rx_bw > peak_net_rx_mbps_) peak_net_rx_mbps_ = rx_bw;
-    }
-
-    mutable std::mutex mutex_;
-    std::vector<ActiveIO> active_ios_;
-    double net_bw_limit_mbps_;         // 网络硬件带宽上限 MB/s
-    double saturation_threshold_ = 0.9;
-    double peak_net_tx_mbps_ = 0.0;
-    double peak_net_rx_mbps_ = 0.0;
-};
-```
+每个 IO 通道的延迟样本写入对应的 reservoir（`latency_samples_[channel]`），使用简单的 reservoir sampling 策略：当 reservoir 未满时直接追加，满后以新样本的延迟值 hash 替换一个已有位置。计算百分位时，从对应通道的 reservoir 排序后计算 avg/p50/p99/max。
 
 ### 4.3 统计报告输出
 
 ```cpp
 // 定期打印统计报告（默认每 5 秒）
 void NodeStats::PrintReport() const {
-    auto stats = GetCurrentStats();
-    uint64_t window_ns = stats.window_end_ns - stats.window_start_ns;
+    // 从各通道 reservoir 计算延迟百分位
+    auto compute_latency = [](ChannelStats& cs, const std::vector<uint64_t>& samples) {
+        if (samples.empty()) return;
+        std::vector<uint64_t> sorted = samples;
+        std::sort(sorted.begin(), sorted.end());
+        double sum = 0.0;
+        for (uint64_t v : sorted) sum += static_cast<double>(v);
+        cs.avg_latency_us = (sum / sorted.size()) / 1000.0;
+        cs.p50_latency_us = sorted[sorted.size() / 2] / 1000.0;
+        cs.p99_latency_us = sorted[static_cast<size_t>(sorted.size() * 0.99)] / 1000.0;
+        cs.max_latency_us = sorted.back() / 1000.0;
+    };
+    // 对每个通道独立计算
+    compute_latency(cw.local_ssd_read,  latency_samples_[0]);
+    compute_latency(cw.local_ssd_write, latency_samples_[1]);
+    compute_latency(cw.net_tx_read,     latency_samples_[2]);
+    compute_latency(cw.net_rx_read,     latency_samples_[3]);
 
-    LOG(INFO) << "\n"
-        "=== FalconKV IO Scheduler Stats ===\n"
-        "Window:              " << stats.window_start_ns << " - "
-                                 << stats.window_end_ns << " ns\n"
-        "\n"
-        "--- 通道带宽分解 ---\n"
-        "LOCAL_SSD_READ:      "
-            << stats.local_ssd_read.BandwidthMBps(window_ns)
-            << " MB/s (" << stats.local_ssd_read.io_count << " IOs)\n"
-        "LOCAL_SSD_WRITE:     "
-            << stats.local_ssd_write.BandwidthMBps(window_ns)
-            << " MB/s (" << stats.local_ssd_write.io_count << " IOs)\n"
-        "NET_TX_READ:         "
-            << stats.net_tx_read.BandwidthMBps(window_ns)
-            << " MB/s (" << stats.net_tx_read.io_count << " IOs)\n"
-        "NET_RX_READ:         "
-            << stats.net_rx_read.BandwidthMBps(window_ns)
-            << " MB/s (" << stats.net_rx_read.io_count << " IOs)\n"
-        "\n"
-        "--- 资源消耗汇总 ---\n"
-        "SSD Bandwidth:       "
-            << stats.SSDBandwidthMBps() << " MB/s\n"
-        "Net TX Bandwidth:    "
-            << stats.NetTxBandwidthMBps() << " MB/s\n"
-        "Net RX Bandwidth:    "
-            << stats.NetRxBandwidthMBps() << " MB/s\n"
-        "SSD Util:            "
-            << (GetSSDBandwidthUtilization() * 100) << "%\n"
-        "Concurrent Peak:     " << stats.concurrent_peak << " IOs\n"
-        "\n"
-        "--- 延迟统计 ---\n"
-        "Latency Avg/P50/P99/Max: "
-            << stats.avg_latency_us << "/"
-            << stats.p50_latency_us << "/"
-            << stats.p99_latency_us << "/"
-            << stats.max_latency_us << " us\n"
-        "\n"
-        "--- 远程节点通道负载 ---\n"
-        "Peak SSD BW Demand:  "
-            << ssd_bw_acc_.GetPeakBandwidthMBps() << " MB/s\n"
-        "Peak Net TX BW:      "
-            << net_bw_acc_.GetPeakNetTxBandwidthMBps() << " MB/s\n"
-        "Peak Net RX BW:      "
-            << net_bw_acc_.GetPeakNetRxBandwidthMBps() << " MB/s\n"
-        "HW SSD BW Limit:     "
-            << ssd_bw_limit_mbps_ << " MB/s\n"
-        "HW Net BW Limit:     "
-            << net_bw_limit_mbps_ << " MB/s\n";
+    // 每个通道一行，输出带宽 + 延迟
+    auto print_ch = [&](const char* label, const ChannelStats& cs) {
+        LOG(INFO) << "  " << label
+                  << "  bytes=" << cs.total_bytes
+                  << "  ios=" << cs.io_count
+                  << "  bw=" << cs.BandwidthMBps(window_ns) << " MB/s"
+                  << "  avg=" << cs.avg_latency_us << " us"
+                  << "  p50=" << cs.p50_latency_us << " us"
+                  << "  p99=" << cs.p99_latency_us << " us"
+                  << "  max=" << cs.max_latency_us << " us";
+    };
 
-    // 输出按远程节点的网络通道负载
-    const auto& node_stats = GetNodeAddrStats();
-    for (const auto& [addr, ns] : node_stats) {
-        LOG(INFO) << "  → " << addr
-            << ": TX " << ns.TotalNetTxBandwidthMBps(window_ns) << " MB/s"
-            << ", RX " << ns.TotalNetRxBandwidthMBps(window_ns) << " MB/s";
+    LOG(INFO) << "=== Node Stats Report ===";
+    print_ch("local_ssd_read ", cw.local_ssd_read);
+    print_ch("local_ssd_write", cw.local_ssd_write);
+    print_ch("net_tx_read    ", cw.net_tx_read);
+    print_ch("net_rx_read    ", cw.net_rx_read);
+
+    // SSD 带宽利用率
+    LOG(INFO) << "  SSD BW utilization: " << (util * 100.0) << "%";
+
+    // 按远程节点的网络通道负载
+    for (const auto& [addr, ns] : node_addr_stats_) {
+        LOG(INFO) << "    " << addr
+            << "  tx_read=" << ns.net_tx_read.io_count
+            << "  rx_read=" << ns.net_rx_read.io_count;
     }
+    LOG(INFO) << "=== End Report ===";
 
-    LOG(INFO) << "===================================";
+    // 重置 reservoir，下一报告周期重新采样
+    ResetPerWindowCounters();
 }
 ```
 
@@ -995,8 +772,6 @@ private:
     Config config_;
     std::unique_ptr<IOSchedulePolicy> policy_;
     std::unique_ptr<NodeStats> stats_;
-    std::unique_ptr<SSDBandwidthAccumulator> ssd_bw_acc_;
-    std::unique_ptr<NetBandwidthAccumulator> net_bw_acc_;
 
     // brpc Server（UDS）
     std::unique_ptr<brpc::Server> server_;
@@ -1014,7 +789,7 @@ Scheduler 启动:
 1. 读取配置文件
 2. 创建 UDS 监听路径（创建 .sock 文件）
 3. 初始化调度策略（PassthroughPolicy）
-4. 初始化统计引擎（NodeStats + BandwidthAccumulator）
+4. 初始化统计引擎（NodeStats，含按通道延迟采样 reservoir）
 5. 启动 brpc Server（监听 UDS）
 6. 启动统计报告线程
 7. 进入服务状态
@@ -1032,12 +807,8 @@ Scheduler 停止:
 ```cpp
 class SchedulerServiceImpl : public FalconKVSchedulerService {
 public:
-    SchedulerServiceImpl(IOSchedulePolicy* policy,
-                         NodeStats* stats,
-                         SSDBandwidthAccumulator* ssd_bw_acc,
-                         NetBandwidthAccumulator* net_bw_acc)
-        : policy_(policy), stats_(stats),
-          ssd_bw_acc_(ssd_bw_acc), net_bw_acc_(net_bw_acc) {}
+    SchedulerServiceImpl(IOSchedulePolicy* policy, NodeStats* stats)
+        : policy_(policy), stats_(stats) {}
 
     void RequestIO(google::protobuf::RpcController* controller,
                    const IORequest* request,
@@ -1045,24 +816,8 @@ public:
                    google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
 
-        // 1. 调度决策（passthrough: 直接放通）
+        // 调度决策（passthrough: 直接放通）
         *response = policy_->Decide(*request);
-
-        // 2. 记录请求到带宽累加器
-        IOChannel channel = request->io_channel();
-        if (ConsumesSSD(channel)) {
-            ssd_bw_acc_->OnIOStart(response->ticket(),
-                                   request->request_ts_ns(),
-                                   request->io_size(),
-                                   channel);
-        }
-        if (IsNetTx(channel) || IsNetRx(channel)) {
-            net_bw_acc_->OnIOStart(response->ticket(),
-                                   request->request_ts_ns(),
-                                   request->io_size(),
-                                   channel,
-                                   request->remote_node_addr());
-        }
     }
 
     void ReportIOCompletion(google::protobuf::RpcController* controller,
@@ -1071,18 +826,7 @@ public:
                             google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
 
-        // 1. 更新带宽累加器
-        IOChannel channel = report->io_channel();
-        if (ConsumesSSD(channel)) {
-            ssd_bw_acc_->OnIODone(report->ticket(),
-                                  report->io_done_ts_ns(),
-                                  report->io_size());
-        }
-        if (IsNetTx(channel) || IsNetRx(channel)) {
-            net_bw_acc_->OnIODone(report->ticket());
-        }
-
-        // 2. 更新统计引擎
+        // 更新统计引擎（含按通道延迟采样）
         IORecord record;
         record.client_id = report->client_id();
         record.store_id = report->store_id();
@@ -1094,7 +838,7 @@ public:
         record.remote_node_addr = report->remote_node_addr();
         stats_->RecordIO(record);
 
-        // 3. 通知调度策略（未来扩展用）
+        // 通知调度策略（未来扩展用）
         policy_->OnIOComplete(*report);
 
         ack->set_status(0);
@@ -1118,13 +862,6 @@ public:
         record.remote_node_addr = report->source_node_addr();
         stats_->RecordIO(record);
 
-        // 更新网络带宽累加器（NET_RX 通道消耗网络接收带宽）
-        net_bw_acc_->OnIOStart(report->store_id(),  // 使用 store_id 作为临时 ticket
-                               report->request_ts_ns(),
-                               report->io_size(),
-                               report->io_channel(),
-                               report->source_node_addr());
-
         ack->set_status(0);
     }
 
@@ -1138,22 +875,8 @@ public:
     }
 
 private:
-    static bool ConsumesSSD(IOChannel ch) {
-        // LOCAL_SSD_READ=0, LOCAL_SSD_WRITE=1, NET_RX_READ=3
-        return ch == LOCAL_SSD_READ || ch == LOCAL_SSD_WRITE
-            || ch == NET_RX_READ;
-    }
-    static bool IsNetTx(IOChannel ch) {
-        return ch == NET_TX_READ;
-    }
-    static bool IsNetRx(IOChannel ch) {
-        return ch == NET_RX_READ;
-    }
-
     IOSchedulePolicy* policy_;
     NodeStats* stats_;
-    SSDBandwidthAccumulator* ssd_bw_acc_;
-    NetBandwidthAccumulator* net_bw_acc_;
 };
 ```
 
@@ -1178,8 +901,8 @@ private:
 │  ┌─────────────────────────────────────────────────────┐     │
 │  │ Stats Report Thread (独立线程)                       │     │
 │  │  - 定期汇总统计窗口                                  │     │
-│  │  - 打印吞吐/时延/并发/带宽利用率报告                 │     │
-│  │  - 更新峰值带宽记录                                  │     │
+│  │  - 按通道计算延迟百分位并打印报告                     │     │
+│  │  - 重置采样 reservoir                                │     │
 │  └─────────────────────────────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────┘
 ```

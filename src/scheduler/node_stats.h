@@ -16,6 +16,12 @@ struct ChannelStats {
     uint64_t total_bytes = 0;
     uint32_t io_count = 0;
 
+    // Per-channel latency percentiles (populated from reservoir)
+    double avg_latency_us = 0.0;
+    double p50_latency_us = 0.0;
+    double p99_latency_us = 0.0;
+    double max_latency_us = 0.0;
+
     double BandwidthMBps(uint64_t window_ns) const {
         if (window_ns == 0) return 0.0;
         return (total_bytes / (1024.0 * 1024.0)) / (window_ns / 1e9);
@@ -44,10 +50,6 @@ struct TimeWindowStats {
     ChannelStats net_rx_read;
 
     uint32_t concurrent_peak = 0;
-    double avg_latency_us = 0.0;
-    double p50_latency_us = 0.0;
-    double p99_latency_us = 0.0;
-    double max_latency_us = 0.0;
 };
 
 // ---------------------------------------------------------------------------
@@ -96,8 +98,8 @@ private:
     double net_bw_limit_mbps_;
     const int window_size_ms_;
 
-    // Reservoir of latency samples for percentile computation.
-    std::vector<uint64_t> latency_samples_;
+    // Per-channel latency reservoirs (index = IOChannel enum value: 0-3)
+    std::array<std::vector<uint64_t>, 4> latency_samples_;
     static constexpr size_t MAX_LATENCY_SAMPLES = 10000;
 
     mutable std::mutex mutex_;
